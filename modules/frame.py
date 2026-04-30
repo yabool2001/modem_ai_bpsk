@@ -11,6 +11,9 @@ with open ( "settings.toml" , "rb" ) as settings_file :
 
 BARKER13_BITS = np.array ( settings[ "BARKER13_BITS" ] , dtype = np.uint8 )
 SPS = modulation.SPS
+BETA = filters.BETA
+SPAN = filters.SPAN
+SAMPLES_PER_BYTE = SYMBOLS_PER_BYTE = ops_data.BITS_PER_BYTE * SPS
 PACKET_LEN_BITS_LEN = 11
 PACKET_LEN_SAMPLES_LEN = PACKET_LEN_SYMBOLS_LEN = PACKET_LEN_BITS_LEN * SPS
 CRC32_BITS_LEN = 32
@@ -66,11 +69,9 @@ class RxFrame :
     frame_start_abs_idx : np.uint32
 
     # Pola uzupełnianie w __post_init__
-    SPAN = filters.SPAN
     header_bpsk_symbols : NDArray[ np.complex64 ] = field ( init = False )
-    frame_start_abs_idx : np.uint32 = field ( init = False )
     frame_end_abs_idx : np.uint32 = field ( init = False )
-    packet_start_abs_idx : NDArray[ np.uint32 ] = field ( init = False )
+    payload_start_abs_idx : NDArray[ np.uint32 ] = field ( init = False )
     leftovers_start_abs_idx : np.uint32 = field ( init = False )
     has_frame : bool = False # ustawiany dopiero po walidacji pakietu, wcześniej używamy tylko lokalnego has_frame_header
     has_leftovers : bool = False
@@ -79,52 +80,46 @@ class RxFrame :
     
     def __post_init__ ( self ) -> None :
         if not self.frame_len_validation () :
-            return self.sync_sequence_peak_abs_idx
+            return self.frame_start_abs_idx
         self.process_packet ()
     
     def process_packet ( self ) -> None :
-        sync_sequence_start_idx = self.SPAN * self.SPS // 2
-        sync_sequence_end_idx = sync_sequence_start_idx + ( SYNC_SEQUENCE_LEN_BITS * self.SPS )
+        sync_sequence_start_idx = 0
+        sync_sequence_end_idx = sync_sequence_start_idx + SYNC_SEQUENCE_SAMPLES_LEN
         packet_len_start_idx = sync_sequence_end_idx
-        packet_len_end_idx = packet_len_start_idx + ( PACKET_LEN_LEN_BITS * self.SPS )
+        packet_len_end_idx = packet_len_start_idx + PACKET_LEN_SAMPLES_LEN
         crc32_start_idx = packet_len_end_idx
-        crc32_end_idx : np.uint32 = np.uint32 ( crc32_start_idx + ( CRC32_LEN_BITS * self.SPS ) )
+        crc32_end_idx : np.uint32 = np.uint32 ( crc32_start_idx + CRC32_SAMPLES_LEN )
 
         samples_components = [ ( self.samples_filtered.real , "sync sequence real" ) , ( self.samples_filtered.imag , "sync sequence imag" ) , ( -self.samples_filtered.real , "sync sequence -real" ) , ( -self.samples_filtered.imag , "sync sequence -imag" ) ]
         for samples_component , samples_name in samples_components :
-            sync_sequence_symbols = samples_component [ sync_sequence_start_idx : sync_sequence_end_idx : self.SPS ]
-            sync_sequence_bits = modulation.bpsk_symbols_2_bits_v0_1_7 ( sync_sequence_symbols )
+            sync_sequence_symbols = samples_component [ sync_sequence_start_idx : sync_sequence_end_idx : SPS ]
+            sync_sequence_bits = modulation.bpsk_symbols_2_bits ( sync_sequence_symbols )
             if np.array_equal ( sync_sequence_bits , BARKER13_BITS ) :
                 has_sync_sequence = True
-                add2log_packet ( f"{t.time()},{has_sync_sequence=},{sync_sequence_start_idx}")
-                packet_len_symbols = samples_component [ packet_len_start_idx : packet_len_end_idx : self.SPS ]
-                packet_len_bits = modulation.bpsk_symbols_2_bits_v0_1_7 ( packet_len_symbols )
+                packet_len_symbols = samples_component [ packet_len_start_idx : packet_len_end_idx : SPS ]
+                packet_len_bits = modulation.bpsk_symbols_2_bits ( packet_len_symbols )
                 packet_len_uint16 = self.bits2uint16 ( packet_len_bits )
                 check_components = [ ( self.samples_filtered.real , " frame real" ) , ( self.samples_filtered.imag , " frame imag" ) , ( -self.samples_filtered.real , " frame -real" ) , ( -self.samples_filtered.imag , " frame -imag" ) ]
                 for samples_comp , frame_name in check_components :
-                    crc32_symbols = samples_comp [ crc32_start_idx : crc32_end_idx : self.SPS ]
-                    crc32_bits = modulation.bpsk_symbols_2_bits_v0_1_7 ( crc32_symbols )
-                    crc32_bytes_read = pad_bits2bytes ( crc32_bits )
-                    crc32_bytes_calculated = create_crc32_bytes ( pad_bits2bytes ( np.concatenate ( [ sync_sequence_bits, packet_len_bits ] ) ) )
+                    crc32_symbols = samples_comp [ crc32_start_idx : crc32_end_idx : SPS ]
+                    crc32_bits = modulation.bpsk_symbols_2_bits ( crc32_symbols )
+                    crc32_bytes_read = ops_data.pad_bits2bytes ( crc32_bits )
+                    crc32_bytes_calculated = ops_data.create_crc32_bytes ( ops_data.pad_bits2bytes ( np.concatenate ( [ sync_sequence_bits , packet_len_bits ] ) ) )
                     if ( crc32_bytes_read == crc32_bytes_calculated ).all () :
-                        packet_end_idx = crc32_end_idx + ( packet_len_uint16 * PACKET_BYTE_LEN_BITS * self.SPS )
+                        payload_end_idx = crc32_end_idx + ( packet_len_uint16 * SAMPLES_PER_BYTE )
                         has_frame_header = True
-                        self.frame_start_abs_idx = self.sync_sequence_peak_abs_idx + sync_sequence_start_idx
-                        add2log_packet ( f"{t.time()},{sync_sequence_start_idx=},{has_frame_header=},{self.frame_start_abs_idx=}" )
-                        if not self.packet_len_validation ( packet_end_idx ) :
-                            add2log_packet ( f"{t.time()},{has_frame_header=},{sync_sequence_start_idx=},{self.frame_start_abs_idx=}" )
+                        if not self.packet_len_validation ( payload_end_idx ) :
                             if settings["log"]["verbose_2"] : print ( f"{self.sync_sequence_peak_abs_idx=} {samples_name} {frame_name=} {has_sync_sequence=}, {has_frame_header=}" )
                             return
-                        packet = RxPacket_v0_1_18 ( samples_filtered = self.samples_filtered [ crc32_end_idx : packet_end_idx ] )
-                        if packet.has_packet :
+                        payload = RxPayload ( symbols = self.symbols [ crc32_end_idx : payload_end_idx ] )
+                        if payload.has_packet :
                             self.has_frame = True
-                            #self.bpsk_symbols = np.concatenate ( [ sync_sequence_symbols , packet_len_symbols , crc32_symbols , packet.packet_symbols ] )
-                            self.header_bpsk_symbols = modulation.bits_2_bpsk_symbols_v0_1_18 ( np.concatenate ( [ sync_sequence_bits , packet_len_bits , crc32_bits ] ) , sps = self.SPS )
-                            self.packet = packet
-                            self.packet_start_abs_idx = self.sync_sequence_peak_abs_idx + crc32_end_idx
-                            self.frame_end_abs_idx = self.sync_sequence_peak_abs_idx + packet_end_idx # to może być tylko wtedy kiedy mamy poprawny pakiet, bo inaczej nie wiemy, czy i gdzie się kończy ramka, a bez tego nie możemy poprawnie ustawić leftoversów
-                            add2log_packet(f"{t.time()},{packet.has_packet=},{crc32_end_idx=}")
-                            if settings["log"]["verbose_2"] : print ( f"{sync_sequence_start_idx=} {has_sync_sequence=}, {self.frame_start_abs_idx=} {self.has_frame=}, {packet.has_packet=}" )
+                            self.header_bpsk_symbols = modulation.bits_2_bpsk_symbols ( np.concatenate ( [ sync_sequence_bits , packet_len_bits , crc32_bits ] ) , sps = SPS )
+                            self.payload = payload
+                            self.payload_start_abs_idx = self.frame_start_abs_idx + crc32_end_idx
+                            self.frame_end_abs_idx = self.frame_start_abs_idx + payload_end_idx # to może być tylko wtedy kiedy mamy poprawny pakiet, bo inaczej nie wiemy, czy i gdzie się kończy ramka, a bez tego nie możemy poprawnie ustawić leftoversów
+                            if settings["log"]["verbose_2"] : print ( f"{sync_sequence_start_idx=} {has_sync_sequence=}, {self.frame_start_abs_idx=} {self.has_frame=}, {payload.has_packet=}" )
                             return
         if settings["log"]["verbose_2"] : print ( f"{self.frame_sync_sequence_peak_abs_idx=} {has_sync_sequence=}, {self.has_frame=}" )
         return
@@ -133,19 +128,19 @@ class RxFrame :
         return modulation.bpsk_symbols_2_bits_v0_1_7 ( samples [ : : self.sps ] )
 
     def bits2uint16 ( self , bits : NDArray[ np.uint8 ] ) -> np.uint16 :
-        return np.uint16 ( bits_2_int ( bits ) )
+        return np.uint16 ( ops_data.bits_2_int ( bits ) )
 
     def samples2bytes ( self , samples : NDArray[ np.complex128 ] ) -> NDArray[ np.uint8 ] :
         bits = self.samples2bits ( samples )
-        return pad_bits2bytes ( bits )
+        return ops_data.pad_bits2bytes ( bits )
     
     def set_leftovers_idx_for_incomplete_frame ( self ) -> None :
-        if settings["log"]["verbose_2"] : print ( f"Samples at index { self.sync_sequence_peak_abs_idx } is too close to the end of samples to contain a complete frame. Skipping." )
-        self.leftovers_start_abs_idx = self.sync_sequence_peak_abs_idx - self.SPAN * self.SPS // 2 # Bez cofniecia się do początku filtra RRC nie ma wykrycia ramnki i pakietu w następnym wywołaniu
+        if settings["log"]["verbose_2"] : print ( f"Samples at index { self.frame_start_abs_idx } is too close to the end of samples to contain a complete frame. Skipping." )
+        self.leftovers_start_abs_idx = self.frame_start_abs_idx - SPAN * SPS // 2 # Bez cofniecia się do początku filtra RRC nie ma wykrycia ramnki i pakietu w następnym wywołaniu
         self.has_leftovers = True
 
     def frame_len_validation ( self ) -> bool :
-        if np.uint32 ( self.symbols.size ) <= np.uint32 ( FRAME_LEN_SAMPLES ) :
+        if np.uint32 ( self.symbols.size ) <= np.uint32 ( FRAME_SAMPLES_LEN ) :
             self.set_leftovers_idx_for_incomplete_frame ()
             return False
         return True
